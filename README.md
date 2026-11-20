@@ -77,5 +77,22 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 管道运营接口（/api/ops）
+
+跨模块管道链路（binlog_parser → change_event → scd_handler）的运营端点，
+注册在通用资源路由之前：
+
+| 端点 | 说明 |
+| --- | --- |
+| `POST /api/ops/consume` | 消费管道事件：完整镜像写入变更追踪清单并交付完整字段增量 |
+| `GET /api/ops/increments` | 已交付的完整字段增量数据清单 |
+| `GET /api/ops/truncation/{entry_id}` | 沿事件消费链路定位镜像截断点 |
+| `POST /api/ops/scd/apply` | 缓慢变化维消费指定事件的字段增量（结果回写变更追踪清单） |
+| `POST /api/ops/scd/replay` | 按源表、事务号和 binlog_pos 回放历史事件（幂等、可重试） |
+| `GET /api/ops/scd/type2` | Type2 状态核对：当前版本、待补字段、实际应用的事件坐标 |
+
+镜像消费不再截断（历史缺陷为消费出口截断到 200 字）；旧前镜像缺失/破损的
+字段按待补登记，与显式 NULL 分开记录。核对脚本：`backend/scripts/verify_cdc_fix.py`。
+
 领域：数据工程
 子方向：数仓与数据湖

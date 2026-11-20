@@ -86,6 +86,12 @@ class PipelineBus:
         self.scd_type1_store: dict[str, dict[str, Any]] = {}  # snapshot
         self.scd_type2_store: dict[str, list[dict[str, Any]]] = {}  # history
         self.scd_type3_store: dict[str, dict[str, Any]] = {}  # prev-col
+        # 字段增量交付日志 — change_event 产出（完整字段增量数据），scd_handler 消费
+        self.increment_log: list[dict[str, Any]] = []
+        # SCD Type2 幂等守卫：dim_key -> 已应用事件坐标（源表+事务号+binlog 坐标）
+        self.scd_type2_applied: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # 待补字段清单：dim_key -> field -> 记录（旧前镜像缺失/破损，与显式 NULL 分开登记）
+        self.pending_backfill: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         # 去重状态 — dedup_window 核心存储
         self.dedup_state: dict[str, list[dict[str, Any]]] = defaultdict(list)
         # 路由规则 — route_dispatcher 核心配置
@@ -172,12 +178,90 @@ class PipelineBus:
         self.scd_type1_store[dim_key] = existing
         return existing
 
-    def apply_scd_type2(self, dim_key: str, row: dict[str, Any]) -> list[dict[str, Any]]:
-        """SCD Type2：保留完整历史。"""
+    def apply_scd_type2(self, dim_key: str, row: dict[str, Any],
+                        event_coord: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """SCD Type2：保留完整历史（幂等）。详见 apply_scd_type2_tracked。"""
+        return self.apply_scd_type2_tracked(dim_key, row, event_coord)["history"]
+
+    # Type2 版本行的元数据列，不参与业务字段等价比较
+    SCD_TYPE2_META_KEYS = ("effective_from", "effective_to", "version")
+
+    @staticmethod
+    def coord_key(coord: dict[str, Any] | None) -> str:
+        """事件坐标规范化：源表 + 事务号 + binlog 文件 + 位置。"""
+        if not coord:
+            return ""
+        return "|".join(str(coord.get(k, ""))
+                        for k in ("source_table", "tx_id", "binlog_file", "binlog_pos"))
+
+    def _business_view(self, row: dict[str, Any]) -> dict[str, Any]:
+        """维度行的业务字段视图（剔除元数据列，用于幂等比较）。"""
+        return {
+            k: v for k, v in row.items()
+            if k not in self.SCD_TYPE2_META_KEYS and not str(k).startswith("_")
+        }
+
+    def apply_scd_type2_tracked(self, dim_key: str, row: dict[str, Any],
+                                event_coord: dict[str, Any] | None = None) -> dict[str, Any]:
+        """SCD Type2 幂等应用。
+
+        - 重复提交（同一事件坐标）：直接返回历史，不再次封存有效维度版本；
+        - 值幂等（业务字段与当前版本一致）：记录坐标但不追加版本、不封存当前版本；
+        - 真实变更：封存旧版本（写 effective_to）并追加新版本。
+        """
         history = self.scd_type2_store.setdefault(dim_key, [])
-        row["version"] = len(history) + 1
-        history.append(dict(row))
-        return list(history)
+        applied = self.scd_type2_applied[dim_key]
+        key = self.coord_key(event_coord)
+        if key and any(self.coord_key(c) == key for c in applied):
+            return {"history": list(history), "action": "duplicate", "version": len(history)}
+        if history and self._business_view(history[-1]) == self._business_view(row):
+            if event_coord:
+                applied.append(dict(event_coord))
+                history[-1].setdefault("_applied_coords", []).append(dict(event_coord))
+            return {"history": list(history), "action": "noop", "version": len(history)}
+        if history:
+            history[-1]["effective_to"] = datetime.now().isoformat()
+        new_row = dict(row)
+        new_row["version"] = len(history) + 1
+        if event_coord:
+            new_row["_applied_event"] = dict(event_coord)
+            new_row["_applied_coords"] = [dict(event_coord)]
+            applied.append(dict(event_coord))
+        history.append(new_row)
+        return {"history": list(history), "action": "append", "version": len(history)}
+
+    def deliver_increment(self, increment: dict[str, Any]) -> dict[str, Any]:
+        """交付完整字段增量数据（按事件ID去重，重复交付覆盖旧档）。"""
+        event_id = increment.get("event_id")
+        self.increment_log = [i for i in self.increment_log if i.get("event_id") != event_id]
+        self.increment_log.append(increment)
+        return increment
+
+    def increments_for(self, event_id: str) -> dict[str, Any] | None:
+        """按事件ID查询已交付的字段增量数据。"""
+        for inc in self.increment_log:
+            if inc.get("event_id") == event_id:
+                return inc
+        return None
+
+    def record_pending_backfill(self, dim_key: str, field: str,
+                                record: dict[str, Any]) -> dict[str, Any]:
+        """登记待补字段：旧前镜像缺失/破损导致无法确认，与显式 NULL 分开记录。
+
+        按 dim_key + field 去重，重试或重复回放不会重复登记，只补充来源事件坐标。
+        """
+        bucket = self.pending_backfill[dim_key]
+        existing = bucket.get(field)
+        if existing:
+            sources = existing.setdefault("source_events", [])
+            known = {self.coord_key(c) for c in sources}
+            for coord in record.get("source_events", []):
+                if self.coord_key(coord) not in known:
+                    sources.append(coord)
+            existing["recorded_at"] = record.get("recorded_at", existing.get("recorded_at"))
+            return existing
+        bucket[field] = dict(record)
+        return bucket[field]
 
     def apply_scd_type3(self, dim_key: str, col_name: str, row: dict[str, Any]) -> dict[str, Any]:
         """SCD Type3：保留前值列。"""
@@ -326,6 +410,9 @@ class PipelineBus:
             "scd_type1_keys": len(self.scd_type1_store),
             "scd_type2_keys": len(self.scd_type2_store),
             "scd_type3_keys": len(self.scd_type3_store),
+            "increment_count": len(self.increment_log),
+            "pending_backfill_fields": sum(len(v) for v in self.pending_backfill.values()),
+            "scd_type2_applied_coords": sum(len(v) for v in self.scd_type2_applied.values()),
             "audit_count": len(self.audit_log),
             "lag_buffer_size": len(self.lag_buffer),
         }

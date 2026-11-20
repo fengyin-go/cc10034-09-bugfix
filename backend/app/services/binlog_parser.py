@@ -29,7 +29,11 @@ class BinlogParserService(BaseModuleService):
         对原始行进行字符集校验、包大小截断和过滤评估后，
         产出 ChangeEventRecord 并推入管道事件总线。
         """
-        max_packet = int(config.get("最大包大小", "16777216").replace("MB", "")) * 1024 * 1024
+        # 最大包大小容错解析：非数字配置（如占位文本）按默认 16MB 处理，
+        # 不再让解析动作在链路入口直接报错。
+        raw_packet = str(config.get("最大包大小", "") or "")
+        packet_digits = "".join(ch for ch in raw_packet if ch.isdigit())
+        max_packet = (int(packet_digits) if packet_digits else 16) * 1024 * 1024
         charset = config.get("字符集", "utf8mb4")
         source_db = config["源数据库"]
         parse_mode = config.get("解析模式", "ROW")
